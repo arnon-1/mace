@@ -1,0 +1,139 @@
+"""`ModelMetadata`: JSON round trip, schema versioning, citation rendering."""
+
+import json
+import subprocess
+import sys
+
+import pytest
+from mace_core.metadata import (
+    SCHEMA_VERSION,
+    Citation,
+    ConfigRecord,
+    DataSummary,
+    E0Details,
+    MetadataSchemaError,
+    ModelMetadata,
+    Provenance,
+    format_citations,
+)
+from pydantic import ValidationError
+
+MACE_PAPER = Citation(
+    title="MACE: Higher Order Equivariant Message Passing Neural Networks "
+    "for Fast and Accurate Force Fields",
+    authors=["I. Batatia", "D. P. Kovacs", "G. N. C. Simm", "C. Ortner", "G. Csanyi"],
+    venue="Advances in Neural Information Processing Systems",
+    year=2022,
+    url="https://arxiv.org/abs/2206.07697",
+)
+
+
+def full_record() -> ModelMetadata:
+    """Every field set, so the round trip is tested on all of them."""
+    return ModelMetadata(
+        config=ConfigRecord(
+            user={"model": {"num_interactions": 3}},
+            resolved={"name": "mace", "model": {"num_interactions": 3, "cutoff": 5.0}},
+        ),
+        provenance=Provenance(code_version="1.0.0", git_commit="a" * 40),
+        data=DataSummary(
+            sources=["train.xyz"],
+            num_configurations=1200,
+            num_atoms=64_000,
+            elements=["H", "O"],
+            reference_keys=["pbe_energy", "pbe_forces"],
+        ),
+        e0=E0Details(
+            source="estimated",
+            method="least_squares",
+            parameters={"reference_key": "pbe_energy"},
+            values={"H": -13.6, "O": -430.2},
+        ),
+        doi="10.5281/zenodo.0000000",
+        citations=[MACE_PAPER, Citation(title="A dataset paper", doi="10.1000/xyz")],
+        notes="Trained for the round-trip test.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round trip and schema version
+
+
+def test_json_round_trip_is_lossless():
+    record = full_record()
+    assert ModelMetadata.from_json(record.to_json()) == record
+
+
+def test_minimal_record_round_trips_too():
+    record = ModelMetadata(provenance=Provenance(code_version="0.0.0"))
+    assert ModelMetadata.from_json(record.to_json()) == record
+    assert record.e0 is None
+
+
+def test_schema_version_is_written():
+    assert json.loads(full_record().to_json())["schema_version"] == SCHEMA_VERSION
+
+
+def test_future_schema_version_is_rejected_clearly():
+    document = json.loads(full_record().to_json())
+    document["schema_version"] = SCHEMA_VERSION + 1
+    with pytest.raises(MetadataSchemaError) as excinfo:
+        ModelMetadata.from_json(json.dumps(document))
+    message = str(excinfo.value)
+    assert f"schema_version {SCHEMA_VERSION + 1}" in message
+    assert f"reads schema_version {SCHEMA_VERSION}" in message
+    assert "upgrade" in message
+
+
+def test_missing_schema_version_is_rejected():
+    document = json.loads(full_record().to_json())
+    del document["schema_version"]
+    with pytest.raises(MetadataSchemaError, match="schema_version None"):
+        ModelMetadata.from_json(json.dumps(document))
+
+
+def test_schema_version_is_pinned_on_direct_validation_as_well():
+    document = json.loads(full_record().to_json())
+    document["schema_version"] = SCHEMA_VERSION + 1
+    with pytest.raises(ValidationError, match="schema_version"):
+        ModelMetadata.model_validate(document)
+
+
+def test_unknown_fields_are_rejected():
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        ModelMetadata(provenance=Provenance(code_version="0"), note="typo")
+
+
+def test_e0_source_is_one_of_two_values():
+    with pytest.raises(ValidationError, match="source"):
+        E0Details(source="guessed")
+
+
+# ---------------------------------------------------------------------------
+# Citations
+
+
+def test_citations_render_to_a_numbered_block():
+    block = format_citations(full_record().citations)
+    assert block.splitlines() == [
+        "[1] I. Batatia, D. P. Kovacs, G. N. C. Simm, C. Ortner, G. Csanyi. "
+        "MACE: Higher Order Equivariant Message Passing Neural Networks for "
+        "Fast and Accurate Force Fields. "
+        "Advances in Neural Information Processing Systems (2022). "
+        "https://arxiv.org/abs/2206.07697",
+        "[2] A dataset paper. https://doi.org/10.1000/xyz",
+    ]
+
+
+def test_no_citations_render_to_nothing():
+    assert format_citations([]) == ""
+
+
+def test_metadata_module_imports_neither_torch_nor_jax():
+    """In a fresh interpreter, so another test's imports cannot mask a leak."""
+    code = (
+        "import sys, mace_core.metadata; "
+        "leaked = {'torch', 'jax', 'e3nn'} & set(sys.modules); "
+        "assert not leaked, leaked"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
