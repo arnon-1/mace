@@ -55,30 +55,30 @@ FILE_VALUES = {
     "data": {"train_file": "train.xyz", "heads": ["pbe", "r2scan"]},
 }
 
-TOML_TEXT = """
-name = "water"
-seed = 7
 
-[model]
-num_interactions = 4
+def to_toml(values, prefix=""):
+    """Enough TOML for a None-free config: scalars and lists share JSON's
+    literal syntax, nested dicts become `[a.b]` tables after the scalars."""
+    lines = [
+        f"{k} = {json.dumps(v)}" for k, v in values.items() if not isinstance(v, dict)
+    ]
+    for key, value in values.items():
+        if isinstance(value, dict):
+            lines += [f"\n[{prefix}{key}]", to_toml(value, f"{prefix}{key}.")]
+    return "\n".join(lines)
 
-[model.radial]
-cutoff = 4.5
 
-[data]
-train_file = "train.xyz"
-heads = ["pbe", "r2scan"]
-"""
+def dump(values, extension):
+    if extension == ".toml":
+        return to_toml(values)
+    if extension == ".json":
+        return json.dumps(values)
+    return yaml.safe_dump(values)
 
 
 def write_config(tmp_path, extension, values=FILE_VALUES):
     path = tmp_path / f"config{extension}"
-    if extension == ".toml":
-        path.write_text(TOML_TEXT, encoding="utf-8")
-    elif extension == ".json":
-        path.write_text(json.dumps(values), encoding="utf-8")
-    else:
-        path.write_text(yaml.safe_dump(values), encoding="utf-8")
+    path.write_text(dump(values, extension), encoding="utf-8")
     return path
 
 
@@ -112,6 +112,22 @@ def test_file_must_be_a_table_at_the_top(tmp_path):
     path = tmp_path / "list.json"
     path.write_text("[1, 2]", encoding="utf-8")
     with pytest.raises(ConfigError, match="table of keys at the top level"):
+        DemoConfig.load(path)
+
+
+def test_missing_file_is_a_config_error(tmp_path):
+    with pytest.raises(ConfigError, match=r"cannot read config file .*nope\.yaml"):
+        DemoConfig.load(tmp_path / "nope.yaml")
+
+
+@pytest.mark.parametrize(
+    ("extension", "text"),
+    [(".toml", "seed = \n"), (".yaml", "seed: [1\n"), (".json", "{")],
+)
+def test_malformed_file_is_a_config_error(tmp_path, extension, text):
+    path = tmp_path / f"broken{extension}"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"cannot parse config file .*broken"):
         DemoConfig.load(path)
 
 
@@ -186,6 +202,26 @@ def test_override_missing_its_value_is_a_config_error():
         DemoConfig.load(cli_overrides=["--seed"])
 
 
+def test_value_starting_with_dashes_needs_the_equals_form():
+    assert DemoConfig.load(cli_overrides=["--name=--odd"]).name == "--odd"
+    # Split off, argparse takes it for an option; the error names `--name`,
+    # not a spurious unknown key `odd`.
+    with pytest.raises(ConfigError, match="argument --name: expected one argument"):
+        DemoConfig.load(cli_overrides=["--name", "--odd"])
+
+
+def test_dict_valued_field_takes_json_and_is_not_dotted_into():
+    class Sources(ReforgeBaseConfig):
+        by_name: dict[str, RadialSection] = Field(default_factory=dict)
+
+    config = Sources.load(cli_overrides=["--by_name", '{"pbe": {"cutoff": 4.0}}'])
+    assert config.by_name == {"pbe": RadialSection(cutoff=4.0)}
+    with pytest.raises(ConfigError, match=r"unknown config key 'by_name\.pbe\.cutoff'"):
+        Sources.load(cli_overrides=["--by_name.pbe.cutoff", "4.0"])
+    with pytest.raises(ConfigError, match=r"unknown config key 'by_name\.pbe\.cutof'"):
+        Sources.load(cli_overrides=["--by_name", '{"pbe": {"cutof": 4.0}}'])
+
+
 # ---------------------------------------------------------------------------
 # Unknown keys name the key and its nearest neighbour, in files and on the CLI.
 
@@ -239,6 +275,19 @@ def test_unknown_key_inside_an_optional_section():
         DemoConfig.load(cli_overrides=["--stage_two.start", "50"])
 
 
+def test_unknown_key_inside_a_union_of_sections_names_the_member(tmp_path):
+    class Either(ReforgeBaseConfig):
+        either: RadialSection | StageTwoSection = RadialSection()
+
+    path = tmp_path / "union.json"
+    path.write_text('{"either": {"cutoff": 4.0, "cutof": 4.0}}', encoding="utf-8")
+    with pytest.raises(ConfigError) as excinfo:
+        Either.load(path)
+    # One message per member pydantic tried; the member's class name is not a key.
+    assert "'either.cutof'; did you mean 'either.cutoff'?" in str(excinfo.value)
+    assert "RadialSection" not in str(excinfo.value)
+
+
 def test_direct_construction_rejects_unknown_keys_too():
     with pytest.raises(ValidationError, match="extra_forbidden"):
         DemoConfig(model={"num_interaction": 3})
@@ -267,19 +316,41 @@ def test_resolved_dict_has_every_default_in_declaration_order(tmp_path):
     assert resolved["data"]["train_file"] is None
 
 
+def assert_fixed_point(tmp_path, first, extension):
+    written = tmp_path / f"resolved{extension}"
+    written.write_text(dump(first, extension), encoding="utf-8")
+    second = DemoConfig.load(written).to_resolved_dict()
+    assert second == first
+    assert json.dumps(second) == json.dumps(first)  # order included
+
+
 @pytest.mark.parametrize("extension", [".yaml", ".json"])
 def test_file_to_resolved_to_file_to_resolved_is_a_fixed_point(tmp_path, extension):
     first = DemoConfig.load(
         write_config(tmp_path, ".toml"), ["--model.num_interactions", "3"]
     ).to_resolved_dict()
-    # TOML cannot write None, so the resolved dict goes back out as YAML or
-    # JSON: both hold everything a resolved config contains.
-    written = tmp_path / f"resolved{extension}"
-    text = json.dumps(first) if extension == ".json" else yaml.safe_dump(first)
-    written.write_text(text, encoding="utf-8")
-    second = DemoConfig.load(written).to_resolved_dict()
-    assert second == first
-    assert json.dumps(second) == json.dumps(first)  # order included
+    assert first["stage_two"] is None  # a None is part of what has to survive
+    assert_fixed_point(tmp_path, first, extension)
+
+
+def test_fixed_point_holds_through_toml_when_nothing_is_none(tmp_path):
+    # TOML has no null, so the optional section is opened and the optional
+    # file name set; the resolved dict then goes through all three formats.
+    first = DemoConfig.load(
+        write_config(tmp_path, ".yaml"), ["--stage_two.start_epoch", "50"]
+    ).to_resolved_dict()
+    assert "null" not in json.dumps(first)
+    for extension in (".toml", ".yaml", ".json"):
+        assert_fixed_point(tmp_path, first, extension)
+
+
+def test_set_fields_are_rejected_at_class_definition():
+    # A set's iteration order changes with the hash seed, so its resolved
+    # export could not be a fixed point across runs.
+    with pytest.raises(TypeError, match=r"Bad\.tags is typed as a set.*Use a list"):
+
+        class Bad(ConfigSection):
+            tags: list[set[str]] = Field(default_factory=list)
 
 
 def test_user_dict_holds_only_what_was_set(tmp_path):

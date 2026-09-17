@@ -18,6 +18,8 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from mace_core.config import ReforgeBaseConfig
+
 __all__ = [
     "SCHEMA_VERSION",
     "Citation",
@@ -51,10 +53,15 @@ class ConfigRecord(_Record):
     Both are the JSON-native dicts a `ReforgeBaseConfig` exports: `user` is
     `to_user_dict()`, the keys the config file and the command line set, and
     `resolved` is `to_resolved_dict()`, every key with defaults filled in.
+    Build it with `from_config()` so the two cannot be mixed up.
     """
 
     user: dict[str, Any] = Field(default_factory=dict)
     resolved: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_config(cls, config: ReforgeBaseConfig) -> ConfigRecord:
+        return cls(user=config.to_user_dict(), resolved=config.to_resolved_dict())
 
 
 class Provenance(_Record):

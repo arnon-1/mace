@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import pytest
+from mace_core.config import ConfigSection, ReforgeBaseConfig
 from mace_core.metadata import (
     SCHEMA_VERSION,
     Citation,
@@ -101,12 +102,27 @@ def test_schema_version_is_pinned_on_direct_validation_as_well():
 
 def test_unknown_fields_are_rejected():
     with pytest.raises(ValidationError, match="extra_forbidden"):
-        ModelMetadata(provenance=Provenance(code_version="0"), note="typo")
+        ModelMetadata.model_validate({"provenance": {"code_version": "0"}, "note": "x"})
 
 
 def test_e0_source_is_one_of_two_values():
     with pytest.raises(ValidationError, match="source"):
-        E0Details(source="guessed")
+        E0Details.model_validate({"source": "guessed"})
+
+
+def test_config_record_is_built_from_a_config():
+    class Section(ConfigSection):
+        cutoff: float = 5.0
+
+    class Config(ReforgeBaseConfig):
+        seed: int = 1
+        model: Section = Section()
+
+    record = ConfigRecord.from_config(Config.model_validate({"model": {"cutoff": 4.0}}))
+    assert record.user == {"model": {"cutoff": 4.0}}
+    assert record.resolved == {"seed": 1, "model": {"cutoff": 4.0}}
+    # The embedded form is the fixed point: resolving it again changes nothing.
+    assert Config.model_validate(record.resolved).to_resolved_dict() == record.resolved
 
 
 # ---------------------------------------------------------------------------

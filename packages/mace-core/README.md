@@ -16,5 +16,6 @@ What is here so far:
   `to_resolved_dict()` for the fully defaulted, round-trippable export.
 - `mace_core.metadata` — `ModelMetadata`, the versioned record every trained
   model carries (config as written and as resolved, provenance, data summary,
-  E0 details, DOI, citations, notes), with a JSON round trip and
+  E0 details, DOI, citations, notes), with a JSON round trip,
+  `ConfigRecord.from_config()` to embed a config in its fixed-point form, and
   `format_citations()`.

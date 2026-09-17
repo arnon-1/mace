@@ -18,6 +18,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    # Floors are declared from the changelogs, not tested: the suite has run on
+    # pydantic 2.13 / pydantic-settings 2.15 only. Raise them if an older pair
+    # turns out to break the CLI source or the extra_forbidden error locations.
     "pydantic>=2.7",
     # CliSettingsSource, which parses the dotted overrides, arrived in 2.3.
     "pydantic-settings>=2.3",
