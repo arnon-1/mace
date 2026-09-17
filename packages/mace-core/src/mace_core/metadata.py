@@ -225,8 +225,10 @@ def format_citations(citations: Iterable[Citation]) -> str:
         parts.append(citation.title)
         if citation.venue and citation.year:
             parts.append(f"{citation.venue} ({citation.year})")
-        elif citation.venue or citation.year:
-            parts.append(str(citation.venue or citation.year))
+        elif citation.venue:
+            parts.append(citation.venue)
+        elif citation.year:
+            parts.append(str(citation.year))
         if citation.doi:
             parts.append(f"https://doi.org/{citation.doi}")
         elif citation.url:

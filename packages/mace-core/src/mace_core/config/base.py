@@ -27,9 +27,11 @@ lowest precedence first:
 Nothing else feeds a config: no environment variables, no dotenv files, so a
 run is reproducible from its file and its command line alone.
 
-Unknown keys are hard errors. Pydantic detects them (`extra="forbid"` on every
-level of the tree); this module turns each into a message that names the key
-by its dotted path and, when there is one, the nearest valid neighbour.
+Unknown keys are hard errors. A CLI key is checked against the schema's
+dotted paths before anything is built; a key in the file, or inside a
+JSON-valued override, is caught by pydantic (`extra="forbid"` on every level
+of the tree). Either way the message names the key by its dotted path and,
+when there is one, the nearest valid neighbour.
 
 Field types are restricted to what survives a JSON round trip unchanged, so
 that the resolved export is a fixed point: `set` and `frozenset` fields are
@@ -100,8 +102,9 @@ def _check_schema(model: type[BaseModel]) -> None:
 
     Each rule protects one guarantee: no sets (order is not stable across
     runs, so the export would not be a fixed point); no aliases or computed
-    fields (the export would not validate back); every section rejects
-    unknown keys (a plain `BaseModel` ignores them, so a typo would vanish).
+    fields (the export would not validate back); every section is a
+    `ConfigSection` (a plain `BaseModel` ignores unknown keys, so a typo
+    would vanish, and skips these checks).
     """
 
     def reject(name: str, reason: str) -> None:
@@ -118,11 +121,11 @@ def _check_schema(model: type[BaseModel]) -> None:
                 "is typed as a set; set order is not stable across runs. Use a list",
             )
         for section, _ in _sections_in(field.annotation):
-            if section.model_config.get("extra") != "forbid":
+            if not issubclass(section, ConfigSection):
                 reject(
                     name,
-                    f"holds {section.__name__}, which accepts unknown keys; "
-                    f"subclass ConfigSection",
+                    f"holds {section.__name__}, which is not a ConfigSection; "
+                    f"subclass it",
                 )
 
 
@@ -168,9 +171,10 @@ class ReforgeBaseConfig(ConfigSection):
         a field at any depth. A value starting with `[` or `{`, or the word
         `null`, is JSON, so a whole section, a list or a dict can be given;
         any other value is a string pydantic converts to the field's type.
-        An override merges into the file like a section does: a dict-valued
-        field gains or replaces entries, so an entry cannot be removed from
-        the command line; a list-valued field is replaced whole.
+        An override merges into the file, and into earlier overrides, like a
+        section does: a dict-valued field gains or replaces entries, so an
+        entry cannot be removed from the command line; a list-valued field
+        is replaced whole.
 
         Raises `ConfigError` for an unknown key, an unreadable file or an
         unparsable override, and pydantic's `ValidationError` for a value of
@@ -204,7 +208,7 @@ class ReforgeBaseConfig(ConfigSection):
 def read_config_file(path: str | Path) -> dict[str, Any]:
     """Parse one config file, choosing the parser by extension.
 
-    An empty file is an empty config. Raises `ConfigError` for a missing
+    An empty TOML or YAML file is an empty config. Raises `ConfigError` for a missing
     file, an unknown extension, a file its parser rejects, or a file whose
     top level is not a table.
     """
@@ -284,11 +288,12 @@ def _parse_overrides(
                     f"override --{name} is not valid JSON: {error}"
                 ) from error
 
-        *sections, field = name.split(".")
-        node = values
-        for section in sections:
-            node = node.setdefault(section, {})
-        node[field] = value
+        # Nest the value under its path and merge it in, so a later override
+        # combines with an earlier one by the same rule as with the file.
+        override: Any = value
+        for section in reversed(name.split(".")):
+            override = {section: override}
+        values = _deep_update(values, override)
 
     if unknown:
         raise ConfigError("\n".join(unknown))

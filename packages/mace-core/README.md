@@ -16,7 +16,8 @@ What is here so far:
   unknown keys rejected with the nearest valid neighbour named, and
   `to_resolved_dict()` for the fully defaulted, round-trippable export.
 - `mace_core.metadata` — `ModelMetadata`, the versioned record every trained
-  model carries (config as written and as resolved, provenance, data summary,
-  E0 details, DOI, citations, notes), with a JSON round trip,
+  model carries (config as written and as resolved, provenance, a summary per
+  data source, E0 details per head, DOI, citations, notes, and the records of
+  the models it was fine-tuned or distilled from), with a JSON round trip,
   `ConfigRecord.from_config()` to embed a config in its fixed-point form, and
   `format_citations()`.

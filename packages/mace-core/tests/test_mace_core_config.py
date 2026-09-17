@@ -191,9 +191,11 @@ def test_override_forms_and_types():
     assert config.data.heads == ["a", "b"]
 
 
-def test_override_of_the_wrong_type_is_a_validation_error():
+def test_value_of_the_wrong_type_is_a_validation_error(tmp_path):
     with pytest.raises(ValidationError, match="seed"):
         DemoConfig.load(cli_overrides=["--seed", "seven"])
+    with pytest.raises(ValidationError, match="seed"):
+        DemoConfig.load(write_config(tmp_path, ".yaml", {"seed": "seven"}))
 
 
 def test_override_missing_its_value_is_a_config_error():
@@ -240,6 +242,25 @@ def test_dict_override_merges_entries_but_list_override_replaces(tmp_path):
     )
     assert set(config.by_name) == {"pbe", "r2scan"}
     assert config.heads == ["c"]
+
+
+def test_later_override_merges_into_an_earlier_one():
+    # Closing a section with null and reopening it, and a dotted value
+    # followed by the whole section, both combine as the file and the CLI do.
+    config = DemoConfig.load(
+        cli_overrides=[
+            "--stage_two",
+            "null",
+            "--stage_two.start_epoch",
+            "5",
+            "--model.radial.cutoff",
+            "4",
+            "--model",
+            '{"num_interactions": 3}',
+        ]
+    )
+    assert config.stage_two == StageTwoSection(start_epoch=5)
+    assert (config.model.num_interactions, config.model.radial.cutoff) == (3, 4.0)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +409,7 @@ def test_field_shapes_the_contract_cannot_keep_are_rejected_at_class_definition(
     shapes = {
         r"tags is typed as a set.*Use a list": ("tags", list[set[str]]),
         r"num has an alias": ("num", Annotated[int, Field(alias="n")]),
-        r"radial holds LenientSection, which accepts unknown keys": (
+        r"radial holds LenientSection, which is not a ConfigSection": (
             "radial",
             LenientSection | None,
         ),
