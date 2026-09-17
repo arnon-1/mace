@@ -377,6 +377,16 @@ def test_environment_variables_are_ignored(monkeypatch):
     assert config.seed == 123
 
 
+@pytest.mark.parametrize("key", ["SEED", "Seed", "_env_file", "_cli_parse_args"])
+def test_root_keys_are_validated_like_any_section(tmp_path, key):
+    # Neither case variants nor pydantic-settings' private constructor
+    # options are special at the top level: unknown is unknown.
+    path = tmp_path / "root.json"
+    path.write_text(json.dumps({key: 1}), encoding="utf-8")
+    with pytest.raises(ConfigError, match=f"unknown config key '{key}'"):
+        DemoConfig.load(path)
+
+
 def test_config_module_imports_neither_torch_nor_jax():
     """In a fresh interpreter, so another test's imports cannot mask a leak."""
     code = (

@@ -31,13 +31,7 @@ from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
-from pydantic_settings import (
-    BaseSettings,
-    CliSettingsSource,
-    PydanticBaseSettingsSource,
-    SettingsConfigDict,
-    SettingsError,
-)
+from pydantic_settings import CliSettingsSource, SettingsError
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -56,6 +50,24 @@ _FILE_PARSERS = {
     ".yml": yaml.safe_load,
     ".json": json.loads,
 }
+
+
+def _reject_set_fields(model: type[BaseModel]) -> None:
+    """Fail at class definition for a field typed with a set at any depth."""
+
+    def holds_set(annotation: Any) -> bool:
+        origin = get_origin(annotation) or annotation
+        if origin in (set, frozenset):
+            return True
+        return any(holds_set(arg) for arg in get_args(annotation))
+
+    for name, field in model.model_fields.items():
+        if holds_set(field.annotation):
+            raise TypeError(
+                f"{model.__name__}.{name} is typed as a set; set order is not "
+                f"stable across runs, so the resolved config would not be a "
+                f"fixed point. Use a list."
+            )
 
 
 class ConfigError(ValueError):
@@ -79,34 +91,20 @@ class ConfigSection(BaseModel):
         _reject_set_fields(cls)
 
 
-class ReforgeBaseConfig(BaseSettings):
+class ReforgeBaseConfig(ConfigSection):
     """Root of a configuration tree. Subclass it; nest `ConfigSection`s in it.
 
     `load()` is the one entry point that reads a file and applies overrides.
     Constructing the class directly behaves like a plain Pydantic model, which
     keeps tests and programmatic construction free of any file or CLI plumbing.
+
+    Deliberately a plain pydantic model, not `pydantic_settings.BaseSettings`:
+    that class merges environment variables and dotenv files in front of
+    validation, case-insensitively and with private constructor options
+    (`_env_file`, ...) that a config file could set. The root is validated
+    exactly like every section below it. pydantic-settings is used for one
+    thing only, turning the argv list into a nested dict.
     """
-
-    model_config = SettingsConfigDict(extra="forbid")
-
-    @classmethod
-    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
-        super().__pydantic_init_subclass__(**kwargs)
-        _reject_set_fields(cls)
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Only explicit values. pydantic-settings would otherwise read every
-        # top-level field from the environment, case-insensitively, so a field
-        # called `path` or `user` would silently pick up $PATH or $USER.
-        return (init_settings,)
 
     @classmethod
     def load(
@@ -136,14 +134,14 @@ class ReforgeBaseConfig(BaseSettings):
             _check_override_names(cls, cli_overrides)
             try:
                 cli_values = CliSettingsSource(
-                    cls, cli_parse_args=list(cli_overrides), cli_exit_on_error=False
+                    cls,  # ty: ignore[invalid-argument-type]  # any BaseModel works
+                    cli_parse_args=list(cli_overrides),
+                    cli_exit_on_error=False,
                 )()
             except SettingsError as error:
                 raise ConfigError(f"cannot parse CLI overrides: {error}") from error
             values = _deep_update(values, cli_values)
         try:
-            # model_validate, not cls(**values): a file key such as `_env_file`
-            # would otherwise be taken for a pydantic-settings init option.
             return cls.model_validate(values)
         except ValidationError as error:
             unknown = _unknown_key_messages(cls, error)
@@ -242,24 +240,6 @@ def _dotted_paths(model: type[BaseModel], prefix: str = "") -> Iterator[str]:
         members = _section_members(model, name)
         if len(members) == 1:
             yield from _dotted_paths(members[0], f"{path}.")
-
-
-def _reject_set_fields(model: type[BaseModel]) -> None:
-    """Fail at class definition for a field typed with a set at any depth."""
-
-    def holds_set(annotation: Any) -> bool:
-        origin = get_origin(annotation) or annotation
-        if origin in (set, frozenset):
-            return True
-        return any(holds_set(arg) for arg in get_args(annotation))
-
-    for name, field in model.model_fields.items():
-        if holds_set(field.annotation):
-            raise TypeError(
-                f"{model.__name__}.{name} is typed as a set; set order is not "
-                f"stable across runs, so the resolved config would not be a "
-                f"fixed point. Use a list."
-            )
 
 
 def _describe_unknown(key: str, candidates: Sequence[str]) -> str:
