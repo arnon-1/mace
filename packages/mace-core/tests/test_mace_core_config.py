@@ -244,10 +244,11 @@ def test_dict_override_merges_entries_but_list_override_replaces(tmp_path):
     assert config.heads == ["c"]
 
 
-def test_later_override_merges_into_an_earlier_one():
-    # Closing a section with null and reopening it, and a dotted value
-    # followed by the whole section, both combine as the file and the CLI do.
+def test_overrides_apply_in_order_on_top_of_the_file(tmp_path):
+    # Closing a section with null and reopening it drops what the file set
+    # in it; a dotted value followed by the whole section keeps both.
     config = DemoConfig.load(
+        write_config(tmp_path, ".yaml", {"stage_two": {"energy_weight": 5.0}}),
         cli_overrides=[
             "--stage_two",
             "null",
@@ -257,7 +258,7 @@ def test_later_override_merges_into_an_earlier_one():
             "4",
             "--model",
             '{"num_interactions": 3}',
-        ]
+        ],
     )
     assert config.stage_two == StageTwoSection(start_epoch=5)
     assert (config.model.num_interactions, config.model.radial.cutoff) == (3, 4.0)

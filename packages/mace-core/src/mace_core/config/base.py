@@ -192,8 +192,7 @@ class ReforgeBaseConfig(ConfigSection):
         values: dict[str, Any] = {}
         if config_file is not None:
             values = read_config_file(config_file)
-        if cli_overrides:
-            values = _deep_update(values, _parse_overrides(cls, cli_overrides))
+        values = _apply_overrides(cls, values, cli_overrides)
         try:
             return cls.model_validate(values)
         except ValidationError as error:
@@ -260,13 +259,12 @@ def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
-def _parse_overrides(
-    model: type[BaseModel], cli_overrides: Sequence[str]
+def _apply_overrides(
+    model: type[BaseModel], values: dict[str, Any], cli_overrides: Sequence[str]
 ) -> dict[str, Any]:
-    """Parse `--a.b value` and `--a.b=value` pairs into a nested dict."""
+    """`values` with the `--a.b value` and `--a.b=value` pairs merged in, in order."""
     valid = list(_dotted_paths(model))
     valid_set = set(valid)
-    values: dict[str, Any] = {}
     unknown: list[str] = []
     tokens = iter(cli_overrides)
 
@@ -297,8 +295,7 @@ def _parse_overrides(
                     f"override --{name} is not valid JSON: {error}"
                 ) from error
 
-        # Nest the value under its path and merge it in, so a later override
-        # combines with an earlier one by the same rule as with the file.
+        # Nested under its path, an override merges by the file's rule.
         override: Any = value
         for section in reversed(name.split(".")):
             override = {section: override}
