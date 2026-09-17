@@ -44,7 +44,9 @@ class MetadataSchemaError(ValueError):
 class _Record(BaseModel):
     """Common ground: unknown keys are errors, so a typo cannot be stored."""
 
-    model_config = ConfigDict(extra="forbid")
+    # inf/nan are written as JSON constants (Infinity, NaN) rather than
+    # pydantic's default null, which would turn a value into a different one.
+    model_config = ConfigDict(extra="forbid", ser_json_inf_nan="constants")
 
 
 class ConfigRecord(_Record):
@@ -134,7 +136,15 @@ class ModelMetadata(_Record):
     notes: str = ""
 
     def to_json(self, indent: int | None = 2) -> str:
-        return self.model_dump_json(indent=indent)
+        """Serialise; raises `MetadataSchemaError` if the text would not read
+        back to this record, so a lossy field can never be stored silently."""
+        text = self.model_dump_json(indent=indent)
+        if self.from_json(text).model_dump_json(indent=indent) != text:
+            raise MetadataSchemaError(
+                "model metadata does not survive a JSON round trip; "
+                "a field holds a value JSON cannot represent"
+            )
+        return text
 
     @classmethod
     def from_json(cls, text: str) -> ModelMetadata:
@@ -143,15 +153,30 @@ class ModelMetadata(_Record):
         Raises `MetadataSchemaError` when the record carries a schema version
         this code does not read, before any field is interpreted.
         """
-        version = json.loads(text).get("schema_version")
+        try:
+            document = json.loads(text)
+        except ValueError as error:
+            raise MetadataSchemaError(
+                f"model metadata is not valid JSON: {error}"
+            ) from error
+        if not isinstance(document, dict):
+            raise MetadataSchemaError(
+                f"model metadata must be a JSON object, not {type(document).__name__}"
+            )
+        version = document.get("schema_version")
+        if type(version) is not int:
+            raise MetadataSchemaError(
+                f"model metadata has schema_version {version!r}; expected the "
+                f"integer {SCHEMA_VERSION}"
+            )
         if version != SCHEMA_VERSION:
             hint = (
                 "it was written by a newer mace-core; upgrade to read it"
-                if isinstance(version, int) and version > SCHEMA_VERSION
+                if version > SCHEMA_VERSION
                 else "no migration exists for it"
             )
             raise MetadataSchemaError(
-                f"model metadata has schema_version {version!r}, but this "
+                f"model metadata has schema_version {version}, but this "
                 f"mace-core reads schema_version {SCHEMA_VERSION}: {hint}"
             )
         return cls.model_validate_json(text)

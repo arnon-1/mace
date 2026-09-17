@@ -52,22 +52,70 @@ _FILE_PARSERS = {
 }
 
 
-def _reject_set_fields(model: type[BaseModel]) -> None:
-    """Fail at class definition for a field typed with a set at any depth."""
+def _sections_in(
+    annotation: Any, inside: bool = False
+) -> Iterator[tuple[type[BaseModel], bool]]:
+    """Every section class reachable from a field annotation, with whether it
+    sits inside a dict/list/tuple (so an error location has a key or index
+    before its fields)."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        yield annotation, inside
+        return
+    origin = get_origin(annotation)
+    if origin in (Union, UnionType):
+        for arg in get_args(annotation):
+            yield from _sections_in(arg, inside)
+    elif origin in (dict, list, tuple):
+        for arg in get_args(annotation):
+            yield from _sections_in(arg, True)
 
-    def holds_set(annotation: Any) -> bool:
-        origin = get_origin(annotation) or annotation
-        if origin in (set, frozenset):
-            return True
-        return any(holds_set(arg) for arg in get_args(annotation))
 
+def _section_of(annotation: Any) -> tuple[type[BaseModel] | None, bool]:
+    """The one section a field can hold, and whether it is inside a collection."""
+    found = dict(_sections_in(annotation))
+    return next(iter(found.items())) if found else (None, False)
+
+
+def _holds_set(annotation: Any) -> bool:
+    origin = get_origin(annotation) or annotation
+    return origin in (set, frozenset) or any(
+        _holds_set(a) for a in get_args(annotation)
+    )
+
+
+def _check_schema(model: type[BaseModel]) -> None:
+    """Fail at class definition for a field shape the contract cannot keep.
+
+    Each rule protects one guarantee: no sets (order is not stable across
+    runs, so the export would not be a fixed point); no aliases or computed
+    fields (the export would not validate back); one section class per field
+    (a union of sections has no single set of valid keys to suggest); every
+    section rejects unknown keys.
+    """
+
+    def reject(name: str, reason: str) -> None:
+        raise TypeError(f"{model.__name__}.{name} {reason}")
+
+    for name in model.model_computed_fields:
+        reject(name, "is a computed field; the export must validate back, so drop it")
     for name, field in model.model_fields.items():
-        if holds_set(field.annotation):
-            raise TypeError(
-                f"{model.__name__}.{name} is typed as a set; set order is not "
-                f"stable across runs, so the resolved config would not be a "
-                f"fixed point. Use a list."
+        if field.alias or field.validation_alias or field.serialization_alias:
+            reject(name, "has an alias; config keys are field names, so drop it")
+        if _holds_set(field.annotation):
+            reject(
+                name,
+                "is typed as a set; set order is not stable across runs. Use a list",
             )
+        sections = {section for section, _ in _sections_in(field.annotation)}
+        if len(sections) > 1:
+            reject(name, "is a union of sections; use one section with a `kind` field")
+        for section in sections:
+            if section.model_config.get("extra") != "forbid":
+                reject(
+                    name,
+                    f"holds {section.__name__}, which accepts unknown keys; "
+                    f"subclass ConfigSection",
+                )
 
 
 class ConfigError(ValueError):
@@ -88,7 +136,7 @@ class ConfigSection(BaseModel):
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         super().__pydantic_init_subclass__(**kwargs)
-        _reject_set_fields(cls)
+        _check_schema(cls)
 
 
 class ReforgeBaseConfig(ConfigSection):
@@ -125,7 +173,8 @@ class ReforgeBaseConfig(ConfigSection):
 
         Raises `ConfigError` for an unknown key, an unreadable file or an
         unparsable override, and pydantic's `ValidationError` for a value of
-        the wrong type.
+        the wrong type. Direct construction skips this and raises pydantic's
+        `ValidationError` for an unknown key too, without a neighbour.
         """
         values: dict[str, Any] = {}
         if config_file is not None:
@@ -153,9 +202,10 @@ class ReforgeBaseConfig(ConfigSection):
         """Every field, defaults included, as JSON-native values.
 
         Keys follow schema declaration order at each level, whatever order the
-        input had. Writing the result to any of the three file formats and
-        loading it back gives an identical config, and resolving that gives an
-        identical dict: the export is a fixed point. (TOML has no null, so a
+        input had; a dict-valued field keeps the order it was given. Writing
+        the result to any of the three file formats and loading it back gives
+        an identical config, and resolving that gives an identical dict: the
+        export is a fixed point. (TOML has no null, so a
         config holding a `None` can only go back out as YAML or JSON.)
         """
         return self.model_dump(mode="json")
@@ -213,33 +263,18 @@ def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
-def _section_members(model: type[BaseModel], name: str) -> tuple[type[BaseModel], ...]:
-    """The section classes field `name` can hold: one for `Section` or
-    `Section | None`, several for a union of sections, none for anything else."""
-    field = model.model_fields.get(name)
-    if field is None:
-        return ()
-    annotation = field.annotation
-    members = (
-        get_args(annotation)
-        if get_origin(annotation) in (Union, UnionType)
-        else (annotation,)
-    )
-    return tuple(m for m in members if isinstance(m, type) and issubclass(m, BaseModel))
-
-
 def _dotted_paths(model: type[BaseModel], prefix: str = "") -> Iterator[str]:
     """Every field of the tree as a dotted path, sections included.
 
-    A union of several sections is a leaf here: the CLI addresses it only as a
-    whole, so the paths below it are not override targets.
+    A section inside a dict or list is not descended into: the CLI addresses
+    such a field only as a whole, with a JSON value.
     """
-    for name in model.model_fields:
+    for name, field in model.model_fields.items():
         path = f"{prefix}{name}"
         yield path
-        members = _section_members(model, name)
-        if len(members) == 1:
-            yield from _dotted_paths(members[0], f"{path}.")
+        section, inside_collection = _section_of(field.annotation)
+        if section is not None and not inside_collection:
+            yield from _dotted_paths(section, f"{path}.")
 
 
 def _describe_unknown(key: str, candidates: Sequence[str]) -> str:
@@ -251,23 +286,28 @@ def _describe_unknown(key: str, candidates: Sequence[str]) -> str:
 
 
 def _check_override_names(model: type[BaseModel], cli_overrides: Sequence[str]) -> None:
-    """Reject `--name` tokens that address no field, before argparse sees them.
+    """Reject option tokens that address no field, before argparse sees them.
 
     argparse would reject them too, but its message names neither the dotted
-    path nor a neighbour, and it stops at the first one. Only tokens in option
-    position are checked: the token after `--name` (no `=`) is its value.
+    path nor a neighbour, it stops at the first one, and on `-h` it prints
+    help and exits the process. Only tokens in option position are checked:
+    the token after `--name` (no `=`) is its value.
     """
     valid = list(_dotted_paths(model))
     unknown = []
     expecting_value = False
     for token in cli_overrides:
-        if expecting_value or not token.startswith("--"):
+        if expecting_value:
             expecting_value = False
-            continue
-        name, _, inline_value = token[2:].partition("=")
-        expecting_value = not inline_value
-        if name not in valid:
-            unknown.append(_describe_unknown(name, valid))
+        elif token.startswith("--"):
+            name, separator, _ = token[2:].partition("=")
+            expecting_value = not separator
+            if name not in valid:
+                unknown.append(_describe_unknown(name, valid))
+        elif token.startswith("-"):
+            unknown.append(
+                f"unknown config option {token!r}; overrides are written --key value"
+            )
     if unknown:
         raise ConfigError("\n".join(unknown))
 
@@ -275,9 +315,10 @@ def _check_override_names(model: type[BaseModel], cli_overrides: Sequence[str]) 
 def _unknown_key_messages(model: type[BaseModel], error: ValidationError) -> list[str]:
     """One message per `extra_forbidden` error, with the neighbour at that level.
 
-    Pydantic's error location interleaves union member names with the field
-    names when a section is a union of sections (`either`, `A`, `z`); those
-    tags pick the member to search in and are left out of the printed path.
+    The error location is walked against the schema: a field name moves into
+    its section, a dict key or list index keeps the section, and the tag
+    pydantic inserts for a `Section | scalar` field (the class name) is
+    skipped and left out of the printed path.
     """
     messages = []
     for item in error.errors():
@@ -285,18 +326,20 @@ def _unknown_key_messages(model: type[BaseModel], error: ValidationError) -> lis
             continue
         *location, key = (str(part) for part in item["loc"])
         section: type[BaseModel] | None = model
-        members: tuple[type[BaseModel], ...] = ()
+        inside_collection = False
         names = []
         for part in location:
-            tagged = [m for m in members if m.__name__ == part]
-            if tagged:  # a union tag, not a key
-                section, members = tagged[0], ()
+            if section is not None and part == section.__name__:
                 continue
-            names.append(part)  # a field, or the key of a dict-valued field
-            members = _section_members(section, part) if section is not None else ()
-            section = members[0] if len(members) == 1 else None
-            if len(members) == 1:
-                members = ()
+            names.append(part)
+            if inside_collection:
+                inside_collection = False
+            elif section is not None and part in section.model_fields:
+                section, inside_collection = _section_of(
+                    section.model_fields[part].annotation
+                )
+            else:
+                section = None
         candidates = list(section.model_fields) if section is not None else []
         prefix = "".join(f"{name}." for name in names)
         messages.append(

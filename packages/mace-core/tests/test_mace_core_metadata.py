@@ -86,11 +86,44 @@ def test_future_schema_version_is_rejected_clearly():
     assert "upgrade" in message
 
 
-def test_missing_schema_version_is_rejected():
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda d: d.pop("schema_version"),
+            "schema_version None; expected the integer 1",
+        ),
+        (lambda d: d.update(schema_version="1"), "schema_version '1'; expected"),
+        (lambda d: d.update(schema_version=1.0), "schema_version 1.0; expected"),
+    ],
+)
+def test_missing_or_non_integer_schema_version_is_rejected(mutate, message):
     document = json.loads(full_record().to_json())
-    del document["schema_version"]
-    with pytest.raises(MetadataSchemaError, match="schema_version None"):
+    mutate(document)
+    with pytest.raises(MetadataSchemaError, match=message):
         ModelMetadata.from_json(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [("[1]", "must be a JSON object, not list"), ("{", "is not valid JSON")],
+)
+def test_non_record_json_is_rejected_with_context(text, message):
+    with pytest.raises(MetadataSchemaError, match=message):
+        ModelMetadata.from_json(text)
+
+
+def test_non_finite_values_survive_the_round_trip():
+    # pydantic's default writes inf/nan as null, which would silently turn an
+    # E0 or a resolved-config value into a different one.
+    record = full_record()
+    assert record.e0 is not None
+    record.e0.values["H"] = float("inf")
+    record.config.resolved["cutoff"] = float("nan")
+    back = ModelMetadata.from_json(record.to_json())
+    assert back.e0 is not None
+    assert back.e0.values["H"] == float("inf")
+    assert back.config.resolved["cutoff"] != back.config.resolved["cutoff"]  # nan
 
 
 def test_schema_version_is_pinned_on_direct_validation_as_well():

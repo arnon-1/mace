@@ -4,11 +4,12 @@ and the resolved export's fixed point."""
 import json
 import subprocess
 import sys
+from typing import Annotated
 
 import pytest
 import yaml
 from mace_core.config import ConfigError, ConfigSection, ReforgeBaseConfig
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, computed_field
 
 # ---------------------------------------------------------------------------
 # The demo schema: two levels of nesting, a list, an optional, a Literal.
@@ -218,7 +219,11 @@ def test_dict_valued_field_takes_json_and_is_not_dotted_into():
     assert config.by_name == {"pbe": RadialSection(cutoff=4.0)}
     with pytest.raises(ConfigError, match=r"unknown config key 'by_name\.pbe\.cutoff'"):
         Sources.load(cli_overrides=["--by_name.pbe.cutoff", "4.0"])
-    with pytest.raises(ConfigError, match=r"unknown config key 'by_name\.pbe\.cutof'"):
+    # Inside an entry, the neighbour is still found: the key passes through.
+    with pytest.raises(
+        ConfigError,
+        match=r"'by_name\.pbe\.cutof'; did you mean 'by_name\.pbe\.cutoff'\?",
+    ):
         Sources.load(cli_overrides=["--by_name", '{"pbe": {"cutof": 4.0}}'])
 
 
@@ -275,17 +280,25 @@ def test_unknown_key_inside_an_optional_section():
         DemoConfig.load(cli_overrides=["--stage_two.start", "50"])
 
 
-def test_unknown_key_inside_a_union_of_sections_names_the_member(tmp_path):
-    class Either(ReforgeBaseConfig):
-        either: RadialSection | StageTwoSection = RadialSection()
+def test_unknown_key_under_a_section_or_scalar_field_drops_the_tag():
+    class SectionOrInt(ReforgeBaseConfig):
+        radial: RadialSection | int = 3
 
-    path = tmp_path / "union.json"
-    path.write_text('{"either": {"cutoff": 4.0, "cutof": 4.0}}', encoding="utf-8")
-    with pytest.raises(ConfigError) as excinfo:
-        Either.load(path)
-    # One message per member pydantic tried; the member's class name is not a key.
-    assert "'either.cutof'; did you mean 'either.cutoff'?" in str(excinfo.value)
-    assert "RadialSection" not in str(excinfo.value)
+    # pydantic tags the location with the member's class name; not a key.
+    with pytest.raises(
+        ConfigError, match=r"'radial\.cutof'; did you mean 'radial\.cutoff'\?"
+    ):
+        SectionOrInt.load(cli_overrides=["--radial", '{"cutof": 4.0}'])
+
+
+def test_help_flag_is_an_error_not_an_exit():
+    with pytest.raises(ConfigError, match=r"unknown config option '-h'"):
+        DemoConfig.load(cli_overrides=["-h"])
+
+
+def test_empty_inline_value_does_not_hide_the_next_option():
+    with pytest.raises(ConfigError, match=r"'sead'; did you mean 'seed'\?"):
+        DemoConfig.load(cli_overrides=["--name=", "--sead", "5"])
 
 
 def test_direct_construction_rejects_unknown_keys_too():
@@ -344,13 +357,36 @@ def test_fixed_point_holds_through_toml_when_nothing_is_none(tmp_path):
         assert_fixed_point(tmp_path, first, extension)
 
 
-def test_set_fields_are_rejected_at_class_definition():
-    # A set's iteration order changes with the hash seed, so its resolved
-    # export could not be a fixed point across runs.
-    with pytest.raises(TypeError, match=r"Bad\.tags is typed as a set.*Use a list"):
+class LenientSection(BaseModel):
+    cutoff: float = 5.0
 
-        class Bad(ConfigSection):
-            tags: list[set[str]] = Field(default_factory=list)
+
+def test_field_shapes_the_contract_cannot_keep_are_rejected_at_class_definition():
+    # Each shape would break a guarantee: set order varies with the hash
+    # seed; aliases and computed fields do not validate back; a union of
+    # sections has no single key set to suggest from; a lenient section
+    # would swallow typos.
+    shapes = {
+        r"tags is typed as a set.*Use a list": ("tags", list[set[str]]),
+        r"num has an alias": ("num", Annotated[int, Field(alias="n")]),
+        r"either is a union of sections": ("either", RadialSection | StageTwoSection),
+        r"radial holds LenientSection, which accepts unknown keys": (
+            "radial",
+            LenientSection | None,
+        ),
+    }
+    for message, (name, annotation) in shapes.items():
+        with pytest.raises(TypeError, match=message):
+            type("Bad", (ConfigSection,), {"__annotations__": {name: annotation}})
+
+    with pytest.raises(TypeError, match=r"double is a computed field"):
+
+        class Computed(ConfigSection):
+            seed: int = 1
+
+            @computed_field
+            def double(self) -> int:
+                return 2 * self.seed
 
 
 def test_user_dict_holds_only_what_was_set(tmp_path):
