@@ -66,9 +66,24 @@ def test_json_round_trip_is_lossless():
 
 
 def test_minimal_record_round_trips_too():
-    record = ModelMetadata(provenance=Provenance(code_version="0.0.0"))
+    record = ModelMetadata(
+        config=ConfigRecord(), provenance=Provenance(code_version="0.0.0")
+    )
     assert ModelMetadata.from_json(record.to_json()) == record
     assert record.e0 is None
+
+
+def test_config_and_provenance_are_mandatory():
+    with pytest.raises(ValidationError, match="config"):
+        ModelMetadata.model_validate({"provenance": {"code_version": "0"}})
+
+
+def test_lossy_value_is_refused_rather_than_stored():
+    record = full_record()
+    assert record.e0 is not None
+    record.e0.parameters["shape"] = (2, 3)  # JSON would bring it back as a list
+    with pytest.raises(MetadataSchemaError, match="does not survive a JSON round trip"):
+        record.to_json()
 
 
 def test_schema_version_is_written():
@@ -113,17 +128,20 @@ def test_non_record_json_is_rejected_with_context(text, message):
         ModelMetadata.from_json(text)
 
 
-def test_non_finite_values_survive_the_round_trip():
+def test_infinity_survives_and_nan_is_refused():
     # pydantic's default writes inf/nan as null, which would silently turn an
-    # E0 or a resolved-config value into a different one.
+    # E0 into a different value. NaN is never equal to itself, so it cannot
+    # pass the round-trip check; an E0 or a config value that is NaN is a bug
+    # upstream, not something to store.
     record = full_record()
     assert record.e0 is not None
     record.e0.values["H"] = float("inf")
-    record.config.resolved["cutoff"] = float("nan")
     back = ModelMetadata.from_json(record.to_json())
     assert back.e0 is not None
     assert back.e0.values["H"] == float("inf")
-    assert back.config.resolved["cutoff"] != back.config.resolved["cutoff"]  # nan
+    record.config.resolved["cutoff"] = float("nan")
+    with pytest.raises(MetadataSchemaError, match="does not survive"):
+        record.to_json()
 
 
 def test_schema_version_is_pinned_on_direct_validation_as_well():
@@ -135,7 +153,9 @@ def test_schema_version_is_pinned_on_direct_validation_as_well():
 
 def test_unknown_fields_are_rejected():
     with pytest.raises(ValidationError, match="extra_forbidden"):
-        ModelMetadata.model_validate({"provenance": {"code_version": "0"}, "note": "x"})
+        ModelMetadata.model_validate(
+            {"config": {}, "provenance": {"code_version": "0"}, "note": "x"}
+        )
 
 
 def test_e0_source_is_one_of_two_values():

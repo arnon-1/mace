@@ -1,10 +1,26 @@
 """The base class every v1 configuration schema derives from.
 
-A configuration is a Pydantic model tree: the top level subclasses
-`ReforgeBaseConfig`, each nested section subclasses `ConfigSection`. A section
-is a table in the file (`[model.radial]`) and a dotted prefix on the command
-line (`--model.radial.cutoff 5.0`). Values come from three layers, lowest
-precedence first:
+A configuration is a tree of fields. A field holds either one value (`seed`,
+`cutoff`) or a named group of further fields; such a group is a *section*.
+The root of the tree subclasses `ReforgeBaseConfig`, every section
+subclasses `ConfigSection`:
+
+    class RadialSection(ConfigSection):
+        num_bessel: int = 8
+        cutoff: float = 5.0
+
+    class ModelSection(ConfigSection):
+        num_interactions: int = 2
+        radial: RadialSection = RadialSection()
+
+    class TrainConfig(ReforgeBaseConfig):
+        seed: int = 1
+        model: ModelSection = ModelSection()
+
+Here `model` and `radial` are sections. In a TOML file a section is a table
+(`[model.radial]`), in YAML/JSON a nested mapping, and on the command line a
+dotted prefix (`--model.radial.cutoff 5.0`). Values come from three layers,
+lowest precedence first:
 
     schema defaults < one config file (.toml/.yaml/.yml/.json) < dotted CLI overrides
 
@@ -51,9 +67,9 @@ _FILE_PARSERS = {
 def _sections_in(
     annotation: Any, inside: bool = False
 ) -> Iterator[tuple[type[BaseModel], bool]]:
-    """Every section class (a `BaseModel` subclass) a field annotation can hold,
-    with whether it sits inside a dict/list/tuple, where an error location has
-    a key or index before the section's own field names."""
+    """Every section class a field annotation can hold (`Radial`, `Radial | None`,
+    `list[Radial]`), with whether it sits inside a dict/list/tuple, where an
+    error location has a key or index before the section's own field names."""
     origin = get_origin(annotation)  # `list` for `list[X]`; None for a plain class
     if origin is None:
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
@@ -84,9 +100,8 @@ def _check_schema(model: type[BaseModel]) -> None:
 
     Each rule protects one guarantee: no sets (order is not stable across
     runs, so the export would not be a fixed point); no aliases or computed
-    fields (the export would not validate back); one section class per field
-    (a union of sections has no single set of valid keys to suggest); every
-    section rejects unknown keys.
+    fields (the export would not validate back); every section rejects
+    unknown keys (a plain `BaseModel` ignores them, so a typo would vanish).
     """
 
     def reject(name: str, reason: str) -> None:
@@ -102,10 +117,7 @@ def _check_schema(model: type[BaseModel]) -> None:
                 name,
                 "is typed as a set; set order is not stable across runs. Use a list",
             )
-        sections = {section for section, _ in _sections_in(field.annotation)}
-        if len(sections) > 1:
-            reject(name, "is a union of sections; use one section with a `kind` field")
-        for section in sections:
+        for section, _ in _sections_in(field.annotation):
             if section.model_config.get("extra") != "forbid":
                 reject(
                     name,
@@ -156,6 +168,9 @@ class ReforgeBaseConfig(ConfigSection):
         a field at any depth. A value starting with `[` or `{`, or the word
         `null`, is JSON, so a whole section, a list or a dict can be given;
         any other value is a string pydantic converts to the field's type.
+        An override merges into the file like a section does: a dict-valued
+        field gains or replaces entries, so an entry cannot be removed from
+        the command line; a list-valued field is replaced whole.
 
         Raises `ConfigError` for an unknown key, an unreadable file or an
         unparsable override, and pydantic's `ValidationError` for a value of

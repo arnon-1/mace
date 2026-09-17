@@ -227,6 +227,21 @@ def test_dict_valued_field_takes_json_and_is_not_dotted_into():
         Sources.load(cli_overrides=["--by_name", '{"pbe": {"cutof": 4.0}}'])
 
 
+def test_dict_override_merges_entries_but_list_override_replaces(tmp_path):
+    class Sources(ReforgeBaseConfig):
+        by_name: dict[str, RadialSection] = Field(default_factory=dict)
+        heads: list[str] = Field(default_factory=list)
+
+    path = write_config(
+        tmp_path, ".yaml", {"by_name": {"pbe": {"cutoff": 4.0}}, "heads": ["a", "b"]}
+    )
+    config = Sources.load(
+        path, ["--by_name", '{"r2scan": {"cutoff": 6.0}}', "--heads", '["c"]']
+    )
+    assert set(config.by_name) == {"pbe", "r2scan"}
+    assert config.heads == ["c"]
+
+
 # ---------------------------------------------------------------------------
 # Unknown keys name the key and its nearest neighbour, in files and on the CLI.
 
@@ -368,13 +383,11 @@ class LenientSection(BaseModel):
 
 def test_field_shapes_the_contract_cannot_keep_are_rejected_at_class_definition():
     # Each shape would break a guarantee: set order varies with the hash
-    # seed; aliases and computed fields do not validate back; a union of
-    # sections has no single key set to suggest from; a lenient section
-    # would swallow typos.
+    # seed; aliases and computed fields do not validate back; a lenient
+    # section would swallow typos.
     shapes = {
         r"tags is typed as a set.*Use a list": ("tags", list[set[str]]),
         r"num has an alias": ("num", Annotated[int, Field(alias="n")]),
-        r"either is a union of sections": ("either", RadialSection | StageTwoSection),
         r"radial holds LenientSection, which accepts unknown keys": (
             "radial",
             LenientSection | None,

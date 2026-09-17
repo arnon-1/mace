@@ -126,7 +126,7 @@ class ModelMetadata(_Record):
 
     #: Pinned to the version this code reads; a bump here is a schema change.
     schema_version: Literal[1] = SCHEMA_VERSION
-    config: ConfigRecord = Field(default_factory=ConfigRecord)
+    config: ConfigRecord
     provenance: Provenance
     data: DataSummary = Field(default_factory=DataSummary)
     e0: E0Details | None = None
@@ -137,9 +137,10 @@ class ModelMetadata(_Record):
 
     def to_json(self, indent: int | None = 2) -> str:
         """Serialise; raises `MetadataSchemaError` if the text would not read
-        back to this record, so a lossy field can never be stored silently."""
+        back to an equal record, so a lossy value (a tuple that comes back as
+        a list, a datetime that comes back as a string) is never stored."""
         text = self.model_dump_json(indent=indent)
-        if self.from_json(text).model_dump_json(indent=indent) != text:
+        if self.from_json(text) != self:
             raise MetadataSchemaError(
                 "model metadata does not survive a JSON round trip; "
                 "a field holds a value JSON cannot represent"
