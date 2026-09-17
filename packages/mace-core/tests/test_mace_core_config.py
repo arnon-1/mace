@@ -183,9 +183,7 @@ def test_override_forms_and_types():
             "--data.train_file",
             "null",
             "--data.heads",
-            "a",
-            "--data.heads",
-            "b",
+            '["a", "b"]',
         ]
     )
     assert config.seed == 9
@@ -199,16 +197,18 @@ def test_override_of_the_wrong_type_is_a_validation_error():
 
 
 def test_override_missing_its_value_is_a_config_error():
-    with pytest.raises(ConfigError, match="cannot parse CLI overrides"):
+    with pytest.raises(ConfigError, match="override --seed is missing its value"):
         DemoConfig.load(cli_overrides=["--seed"])
 
 
-def test_value_starting_with_dashes_needs_the_equals_form():
+def test_override_that_is_not_valid_json_is_a_config_error():
+    with pytest.raises(ConfigError, match="override --model is not valid JSON"):
+        DemoConfig.load(cli_overrides=["--model", "{oops"])
+
+
+def test_value_starting_with_dashes_works_in_both_forms():
     assert DemoConfig.load(cli_overrides=["--name=--odd"]).name == "--odd"
-    # Split off, argparse takes it for an option; the error names `--name`,
-    # not a spurious unknown key `odd`.
-    with pytest.raises(ConfigError, match="argument --name: expected one argument"):
-        DemoConfig.load(cli_overrides=["--name", "--odd"])
+    assert DemoConfig.load(cli_overrides=["--name", "--odd"]).name == "--odd"
 
 
 def test_dict_valued_field_takes_json_and_is_not_dotted_into():
@@ -294,6 +294,11 @@ def test_unknown_key_under_a_section_or_scalar_field_drops_the_tag():
 def test_help_flag_is_an_error_not_an_exit():
     with pytest.raises(ConfigError, match=r"unknown config option '-h'"):
         DemoConfig.load(cli_overrides=["-h"])
+
+
+def test_abbreviated_option_is_unknown_not_expanded():
+    with pytest.raises(ConfigError, match=r"key 'se'; did you mean 'seed'"):
+        DemoConfig.load(cli_overrides=["--se", "3"])
 
 
 def test_empty_inline_value_does_not_hide_the_next_option():
@@ -415,7 +420,7 @@ def test_environment_variables_are_ignored(monkeypatch):
 
 @pytest.mark.parametrize("key", ["SEED", "Seed", "_env_file", "_cli_parse_args"])
 def test_root_keys_are_validated_like_any_section(tmp_path, key):
-    # Neither case variants nor pydantic-settings' private constructor
+    # Neither case variants nor BaseSettings-style private constructor
     # options are special at the top level: unknown is unknown.
     path = tmp_path / "root.json"
     path.write_text(json.dumps({key: 1}), encoding="utf-8")

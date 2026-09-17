@@ -11,7 +11,7 @@ What is here so far:
 
 - `mace_core.config` — `ReforgeBaseConfig`, the pydantic base every v1
   config schema derives from: one TOML/YAML/JSON file plus dotted CLI
-  overrides (`--model.num_interactions 3`, parsed by pydantic-settings),
+  overrides (`--model.num_interactions 3`),
   precedence defaults < file < CLI,
   unknown keys rejected with the nearest valid neighbour named, and
   `to_resolved_dict()` for the fully defaulted, round-trippable export.

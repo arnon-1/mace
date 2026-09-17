@@ -18,15 +18,13 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    # Floors are declared from the changelogs, not tested: the suite has run on
-    # pydantic 2.13 / pydantic-settings 2.15 only. Raise them if an older pair
-    # turns out to break the CLI source or the extra_forbidden error locations.
+    # The suite passes at this floor (2.7.4 on Python 3.10) and at current
+    # releases.
     "pydantic>=2.7",
-    # CliSettingsSource, which parses the dotted overrides, arrived in 2.3.
-    "pydantic-settings>=2.3",
     "pyyaml>=6.0",
-    # tomllib is stdlib from 3.11; tomli is its backport with the same API.
-    "tomli>=2.0; python_version < '3.11'",
+    # The stdlib tomllib exists only from 3.11; tomli is the same code on
+    # every version, and one import is simpler than a version branch.
+    "tomli>=2.0",
 ]
 
 [project.urls]

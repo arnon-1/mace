@@ -1,8 +1,10 @@
 """The base class every v1 configuration schema derives from.
 
 A configuration is a Pydantic model tree: the top level subclasses
-`ReforgeBaseConfig`, each nested section subclasses `ConfigSection`. Values come
-from three layers, lowest precedence first:
+`ReforgeBaseConfig`, each nested section subclasses `ConfigSection`. A section
+is a table in the file (`[model.radial]`) and a dotted prefix on the command
+line (`--model.radial.cutoff 5.0`). Values come from three layers, lowest
+precedence first:
 
     schema defaults < one config file (.toml/.yaml/.yml/.json) < dotted CLI overrides
 
@@ -23,20 +25,14 @@ from __future__ import annotations
 
 import difflib
 import json
-import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
 
+import tomli
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
-from pydantic_settings import CliSettingsSource, SettingsError
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -45,7 +41,7 @@ __all__ = ["ConfigError", "ConfigSection", "ReforgeBaseConfig", "read_config_fil
 
 #: Config file extensions this module reads, keyed to their parsers.
 _FILE_PARSERS = {
-    ".toml": tomllib.loads,
+    ".toml": tomli.loads,
     ".yaml": yaml.safe_load,
     ".yml": yaml.safe_load,
     ".json": json.loads,
@@ -55,14 +51,14 @@ _FILE_PARSERS = {
 def _sections_in(
     annotation: Any, inside: bool = False
 ) -> Iterator[tuple[type[BaseModel], bool]]:
-    """Every section class reachable from a field annotation, with whether it
-    sits inside a dict/list/tuple (so an error location has a key or index
-    before its fields)."""
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        yield annotation, inside
-        return
-    origin = get_origin(annotation)
-    if origin in (Union, UnionType):
+    """Every section class (a `BaseModel` subclass) a field annotation can hold,
+    with whether it sits inside a dict/list/tuple, where an error location has
+    a key or index before the section's own field names."""
+    origin = get_origin(annotation)  # `list` for `list[X]`; None for a plain class
+    if origin is None:
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            yield annotation, inside
+    elif origin in (Union, UnionType):
         for arg in get_args(annotation):
             yield from _sections_in(arg, inside)
     elif origin in (dict, list, tuple):
@@ -76,11 +72,11 @@ def _section_of(annotation: Any) -> tuple[type[BaseModel] | None, bool]:
     return next(iter(found.items())) if found else (None, False)
 
 
-def _holds_set(annotation: Any) -> bool:
-    origin = get_origin(annotation) or annotation
-    return origin in (set, frozenset) or any(
-        _holds_set(a) for a in get_args(annotation)
-    )
+def _contains_a_set(annotation: Any) -> bool:
+    """A bare `set`, a `set[X]`, or a set anywhere inside, e.g. `list[set[int]]`."""
+    if annotation in (set, frozenset) or get_origin(annotation) in (set, frozenset):
+        return True
+    return any(_contains_a_set(arg) for arg in get_args(annotation))
 
 
 def _check_schema(model: type[BaseModel]) -> None:
@@ -101,7 +97,7 @@ def _check_schema(model: type[BaseModel]) -> None:
     for name, field in model.model_fields.items():
         if field.alias or field.validation_alias or field.serialization_alias:
             reject(name, "has an alias; config keys are field names, so drop it")
-        if _holds_set(field.annotation):
+        if _contains_a_set(field.annotation):
             reject(
                 name,
                 "is typed as a set; set order is not stable across runs. Use a list",
@@ -129,7 +125,8 @@ class ConfigError(ValueError):
 
 
 class ConfigSection(BaseModel):
-    """A nested section of a configuration. Unknown keys are errors here too."""
+    """A nested section of a configuration: a table in the file, a dotted
+    prefix on the command line. Unknown keys are errors here too."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -142,16 +139,8 @@ class ConfigSection(BaseModel):
 class ReforgeBaseConfig(ConfigSection):
     """Root of a configuration tree. Subclass it; nest `ConfigSection`s in it.
 
-    `load()` is the one entry point that reads a file and applies overrides.
-    Constructing the class directly behaves like a plain Pydantic model, which
-    keeps tests and programmatic construction free of any file or CLI plumbing.
-
-    Deliberately a plain pydantic model, not `pydantic_settings.BaseSettings`:
-    that class merges environment variables and dotenv files in front of
-    validation, case-insensitively and with private constructor options
-    (`_env_file`, ...) that a config file could set. The root is validated
-    exactly like every section below it. pydantic-settings is used for one
-    thing only, turning the argv list into a nested dict.
+    `load()` reads a file and applies overrides. Constructing the class
+    directly behaves like a plain Pydantic model.
     """
 
     @classmethod
@@ -163,33 +152,20 @@ class ReforgeBaseConfig(ConfigSection):
         """Build the config from defaults, then the file, then the overrides.
 
         `cli_overrides` is the argument list after the program name, e.g.
-        `["--model.num_interactions", "3", "--seed=7"]`; the dotted path names
-        a field at any depth of the tree. Values are parsed against the
-        field's type by pydantic-settings, so lists and `null` work as well as
-        scalars. A value that itself starts with `--` has to be written
-        `--name=--value`. A whole section, and a dict-valued field, take a JSON
-        value (`--model '{"num_interactions": 3}'`); entries of a dict cannot
-        be addressed by dotted path.
+        `["--model.num_interactions", "3", "--seed=7"]`: a dotted path names
+        a field at any depth. A value starting with `[` or `{`, or the word
+        `null`, is JSON, so a whole section, a list or a dict can be given;
+        any other value is a string pydantic converts to the field's type.
 
         Raises `ConfigError` for an unknown key, an unreadable file or an
         unparsable override, and pydantic's `ValidationError` for a value of
-        the wrong type. Direct construction skips this and raises pydantic's
-        `ValidationError` for an unknown key too, without a neighbour.
+        the wrong type.
         """
         values: dict[str, Any] = {}
         if config_file is not None:
             values = read_config_file(config_file)
         if cli_overrides:
-            _check_override_names(cls, cli_overrides)
-            try:
-                cli_values = CliSettingsSource(
-                    cls,  # ty: ignore[invalid-argument-type]  # any BaseModel works
-                    cli_parse_args=list(cli_overrides),
-                    cli_exit_on_error=False,
-                )()
-            except SettingsError as error:
-                raise ConfigError(f"cannot parse CLI overrides: {error}") from error
-            values = _deep_update(values, cli_values)
+            values = _deep_update(values, _parse_overrides(cls, cli_overrides))
         try:
             return cls.model_validate(values)
         except ValidationError as error:
@@ -199,24 +175,14 @@ class ReforgeBaseConfig(ConfigSection):
             raise ConfigError("\n".join(unknown)) from error
 
     def to_resolved_dict(self) -> dict[str, Any]:
-        """Every field, defaults included, as JSON-native values.
-
-        Keys follow schema declaration order at each level, whatever order the
-        input had; a dict-valued field keeps the order it was given. Writing
-        the result to any of the three file formats and loading it back gives
-        an identical config, and resolving that gives an identical dict: the
-        export is a fixed point. (TOML has no null, so a
-        config holding a `None` can only go back out as YAML or JSON.)
-        """
+        """Every field, defaults included, as JSON-native values, in schema
+        order. Loading the result back and resolving again gives the same
+        dict. (TOML has no null, so a `None` can only go out as YAML or JSON.)"""
         return self.model_dump(mode="json")
 
     def to_user_dict(self) -> dict[str, Any]:
-        """Only the fields the file and the overrides set, as JSON-native values.
-
-        The complement of `to_resolved_dict()`: what the user actually wrote,
-        with defaults left out, for the model metadata's record of user-set
-        configuration.
-        """
+        """Only the fields the file and the overrides set, as JSON-native
+        values: what the user wrote, for the model metadata."""
         return self.model_dump(mode="json", exclude_unset=True)
 
 
@@ -240,10 +206,13 @@ def read_config_file(path: str | Path) -> dict[str, Any]:
         raise ConfigError(
             f"cannot read config file {path}: {error.strerror}"
         ) from error
-    except (ValueError, yaml.YAMLError) as error:  # tomllib/json errors are ValueErrors
+    except (ValueError, yaml.YAMLError) as error:  # tomli/json errors are ValueErrors
         raise ConfigError(f"cannot parse config file {path}: {error}") from error
     if values is None:
         return {}
+    # TOML always yields a table, but a YAML or JSON file can hold a list or a
+    # scalar, which would crash the merge with the overrides instead of
+    # naming the file.
     if not isinstance(values, dict):
         raise ConfigError(
             f"config file {path} must hold a table of keys at the top level, "
@@ -263,6 +232,44 @@ def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def _parse_overrides(
+    model: type[BaseModel], cli_overrides: Sequence[str]
+) -> dict[str, Any]:
+    """`--a.b value` and `--a.b=value` pairs as a nested dict; see `load()`."""
+    valid = list(_dotted_paths(model))
+    values: dict[str, Any] = {}
+    unknown = []
+    tokens = iter(cli_overrides)
+    for token in tokens:
+        name, has_equals, value = token.removeprefix("--").partition("=")
+        if not token.startswith("--") or not name:
+            raise ConfigError(
+                f"unknown config option {token!r}; overrides are written --key value"
+            )
+        if not has_equals:
+            value = next(tokens, None)
+            if value is None:
+                raise ConfigError(f"override --{name} is missing its value")
+        if name not in valid:
+            unknown.append(_unknown_key_message(name, valid))
+            continue
+        if value == "null" or value[:1] in ("[", "{"):
+            try:
+                value = json.loads(value)
+            except ValueError as error:
+                raise ConfigError(
+                    f"override --{name} is not valid JSON: {error}"
+                ) from error
+        *sections, field = name.split(".")
+        node = values
+        for section in sections:
+            node = node.setdefault(section, {})
+        node[field] = value
+    if unknown:
+        raise ConfigError("\n".join(unknown))
+    return values
+
+
 def _dotted_paths(model: type[BaseModel], prefix: str = "") -> Iterator[str]:
     """Every field of the tree as a dotted path, sections included.
 
@@ -277,7 +284,7 @@ def _dotted_paths(model: type[BaseModel], prefix: str = "") -> Iterator[str]:
             yield from _dotted_paths(section, f"{path}.")
 
 
-def _describe_unknown(key: str, candidates: Sequence[str]) -> str:
+def _unknown_key_message(key: str, candidates: Sequence[str]) -> str:
     message = f"unknown config key {key!r}"
     closest = difflib.get_close_matches(key, candidates, n=1)
     if closest:
@@ -285,40 +292,14 @@ def _describe_unknown(key: str, candidates: Sequence[str]) -> str:
     return message
 
 
-def _check_override_names(model: type[BaseModel], cli_overrides: Sequence[str]) -> None:
-    """Reject option tokens that address no field, before argparse sees them.
-
-    argparse would reject them too, but its message names neither the dotted
-    path nor a neighbour, it stops at the first one, and on `-h` it prints
-    help and exits the process. Only tokens in option position are checked:
-    the token after `--name` (no `=`) is its value.
-    """
-    valid = list(_dotted_paths(model))
-    unknown = []
-    expecting_value = False
-    for token in cli_overrides:
-        if expecting_value:
-            expecting_value = False
-        elif token.startswith("--"):
-            name, separator, _ = token[2:].partition("=")
-            expecting_value = not separator
-            if name not in valid:
-                unknown.append(_describe_unknown(name, valid))
-        elif token.startswith("-"):
-            unknown.append(
-                f"unknown config option {token!r}; overrides are written --key value"
-            )
-    if unknown:
-        raise ConfigError("\n".join(unknown))
-
-
 def _unknown_key_messages(model: type[BaseModel], error: ValidationError) -> list[str]:
-    """One message per `extra_forbidden` error, with the neighbour at that level.
+    """Pydantic's unknown-key errors as messages that name the full dotted
+    path and the closest valid key at that level.
 
-    The error location is walked against the schema: a field name moves into
-    its section, a dict key or list index keeps the section, and the tag
-    pydantic inserts for a `Section | scalar` field (the class name) is
-    skipped and left out of the printed path.
+    The error location is walked against the schema to find the section whose
+    fields are the candidates: a field name moves into its section, a dict key
+    or list index stays in it, and the tag pydantic inserts for a
+    `Section | scalar` field (the class name) is dropped from the path.
     """
     messages = []
     for item in error.errors():
@@ -343,6 +324,6 @@ def _unknown_key_messages(model: type[BaseModel], error: ValidationError) -> lis
         candidates = list(section.model_fields) if section is not None else []
         prefix = "".join(f"{name}." for name in names)
         messages.append(
-            _describe_unknown(f"{prefix}{key}", [f"{prefix}{c}" for c in candidates])
+            _unknown_key_message(f"{prefix}{key}", [f"{prefix}{c}" for c in candidates])
         )
     return messages
