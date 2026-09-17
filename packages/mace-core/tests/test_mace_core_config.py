@@ -404,11 +404,13 @@ class LenientSection(BaseModel):
 
 def test_field_shapes_the_contract_cannot_keep_are_rejected_at_class_definition():
     # Each shape would break a guarantee: set order varies with the hash
-    # seed; aliases and computed fields do not validate back; a lenient
-    # section would swallow typos.
+    # seed; aliases and computed fields do not validate back; a union of
+    # sections would let a value pick its section; a lenient section would
+    # swallow typos.
     shapes = {
         r"tags is typed as a set.*Use a list": ("tags", list[set[str]]),
         r"num has an alias": ("num", Annotated[int, Field(alias="n")]),
+        r"either is a union of sections": ("either", RadialSection | StageTwoSection),
         r"radial holds LenientSection, which is not a ConfigSection": (
             "radial",
             LenientSection | None,

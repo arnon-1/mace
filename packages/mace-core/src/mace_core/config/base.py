@@ -102,7 +102,9 @@ def _check_schema(model: type[BaseModel]) -> None:
 
     Each rule protects one guarantee: no sets (order is not stable across
     runs, so the export would not be a fixed point); no aliases or computed
-    fields (the export would not validate back); every section is a
+    fields (the export would not validate back); one section class per field
+    (a value must not become whichever alternative happens to accept it, and
+    the CLI needs one set of valid keys under a field); every section is a
     `ConfigSection` (a plain `BaseModel` ignores unknown keys, so a typo
     would vanish, and skips these checks).
     """
@@ -120,7 +122,14 @@ def _check_schema(model: type[BaseModel]) -> None:
                 name,
                 "is typed as a set; set order is not stable across runs. Use a list",
             )
-        for section, _ in _sections_in(field.annotation):
+        sections = {section for section, _ in _sections_in(field.annotation)}
+        if len(sections) > 1:
+            reject(
+                name,
+                "is a union of sections; give each alternative its own optional "
+                "field, e.g. `huber: HuberLoss | None`",
+            )
+        for section in sections:
             if not issubclass(section, ConfigSection):
                 reject(
                     name,
