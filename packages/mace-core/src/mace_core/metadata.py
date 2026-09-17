@@ -24,10 +24,12 @@ __all__ = [
     "SCHEMA_VERSION",
     "Citation",
     "ConfigRecord",
+    "DataSourceSummary",
     "DataSummary",
     "E0Details",
     "MetadataSchemaError",
     "ModelMetadata",
+    "ParentModel",
     "Provenance",
     "format_citations",
 ]
@@ -75,17 +77,18 @@ class Provenance(_Record):
     git_commit: str | None = None
 
 
-class DataSummary(_Record):
-    """Automated summary of the fitting data.
+class DataSourceSummary(_Record):
+    """Automated summary of one data source.
 
     Reference-quantity keys name the method that produced the reference as a
     prefix on the quantity: `pbe_energy`, `pbe_forces`, `r2scan_energy`.
-    `reference_keys` lists the keys the model was fitted to, under that
-    convention, so a reader can tell which level of theory a model reproduces.
+    `reference_keys` lists the keys this source was fitted to, under that
+    convention, so a reader can tell which level of theory each head
+    reproduces. Which heads a source feeds is in the resolved config.
     """
 
-    #: Files or dataset names the fitting data came from.
-    sources: list[str] = Field(default_factory=list)
+    #: The data source's name in the config.
+    name: str
     num_configurations: int | None = None
     num_atoms: int | None = None
     #: Chemical symbols of every element present.
@@ -93,8 +96,14 @@ class DataSummary(_Record):
     reference_keys: list[str] = Field(default_factory=list)
 
 
+class DataSummary(_Record):
+    """One summary per data source; totals are sums over them, not stored."""
+
+    sources: list[DataSourceSummary] = Field(default_factory=list)
+
+
 class E0Details(_Record):
-    """How the per-element reference energies (the E0s) were obtained.
+    """How one head's per-element reference energies (the E0s) were obtained.
 
     `values` maps chemical symbol to E0 in the model's energy unit. Symbols
     rather than atomic numbers, because JSON keys are strings and an integer
@@ -129,11 +138,15 @@ class ModelMetadata(_Record):
     config: ConfigRecord
     provenance: Provenance
     data: DataSummary = Field(default_factory=DataSummary)
-    e0: E0Details | None = None
+    #: Keyed by head name, as in the config; every head has its own E0 table.
+    e0: dict[str, E0Details] = Field(default_factory=dict)
     #: DOI of the model itself, not of the papers describing it.
     doi: str | None = None
     citations: list[Citation] = Field(default_factory=list)
     notes: str = ""
+    #: The models this one was built from, each with its own record inside, so
+    #: the whole lineage travels with the model.
+    parents: list[ParentModel] = Field(default_factory=list)
 
     def to_json(self, indent: int | None = 2) -> str:
         """Serialise; raises `MetadataSchemaError` if the text would not read
@@ -181,6 +194,21 @@ class ModelMetadata(_Record):
                 f"mace-core reads schema_version {SCHEMA_VERSION}: {hint}"
             )
         return cls.model_validate_json(text)
+
+
+class ParentModel(_Record):
+    """A model this one was built from."""
+
+    #: What the parent contributed: its weights as the starting point (fine-tuning
+    #: or continued training), or its predictions as distillation targets.
+    role: Literal["initial_weights", "teacher"]
+    #: How the config named it: a path or a registry name such as "mace-mp-0b3".
+    name: str
+    #: The parent's own record; None for a legacy checkpoint that carries none.
+    metadata: ModelMetadata | None = None
+
+
+ModelMetadata.model_rebuild()  # `parents` refers to the class defined after it
 
 
 def format_citations(citations: Iterable[Citation]) -> str:

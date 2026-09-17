@@ -250,38 +250,49 @@ def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]
 def _parse_overrides(
     model: type[BaseModel], cli_overrides: Sequence[str]
 ) -> dict[str, Any]:
-    """`--a.b value` and `--a.b=value` pairs as a nested dict; see `load()`."""
+    """Parse `--a.b value` and `--a.b=value` pairs into a nested dict."""
     valid = list(_dotted_paths(model))
+    valid_set = set(valid)
     values: dict[str, Any] = {}
-    unknown = []
+    unknown: list[str] = []
     tokens = iter(cli_overrides)
+
     for token in tokens:
-        name, has_equals, value = token.removeprefix("--").partition("=")
+        option = token.removeprefix("--")
+        if "=" in option:
+            name, value = option.split("=", 1)
+        else:
+            name, value = option, None
         if not token.startswith("--") or not name:
             raise ConfigError(
                 f"unknown config option {token!r}; overrides are written --key value"
             )
-        if not has_equals:
+        if value is None:
             value = next(tokens, None)
             if value is None:
                 raise ConfigError(f"override --{name} is missing its value")
-        if name not in valid:
+
+        if name not in valid_set:
             unknown.append(_unknown_key_message(name, valid))
             continue
-        if value == "null" or value[:1] in ("[", "{"):
+
+        if value == "null" or value.startswith(("[", "{")):
             try:
                 value = json.loads(value)
             except ValueError as error:
                 raise ConfigError(
                     f"override --{name} is not valid JSON: {error}"
                 ) from error
+
         *sections, field = name.split(".")
         node = values
         for section in sections:
             node = node.setdefault(section, {})
         node[field] = value
+
     if unknown:
         raise ConfigError("\n".join(unknown))
+
     return values
 
 
@@ -318,6 +329,8 @@ def _unknown_key_messages(model: type[BaseModel], error: ValidationError) -> lis
     """
     messages = []
     for item in error.errors():
+        # pydantic's error code for a key that matches no field (extra="forbid").
+        # Every other code, e.g. a wrong type, is left for `load()` to re-raise.
         if item["type"] != "extra_forbidden":
             continue
         *location, key = (str(part) for part in item["loc"])

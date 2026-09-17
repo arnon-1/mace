@@ -10,10 +10,12 @@ from mace_core.metadata import (
     SCHEMA_VERSION,
     Citation,
     ConfigRecord,
+    DataSourceSummary,
     DataSummary,
     E0Details,
     MetadataSchemaError,
     ModelMetadata,
+    ParentModel,
     Provenance,
     format_citations,
 )
@@ -38,18 +40,26 @@ def full_record() -> ModelMetadata:
         ),
         provenance=Provenance(code_version="1.0.0", git_commit="a" * 40),
         data=DataSummary(
-            sources=["train.xyz"],
-            num_configurations=1200,
-            num_atoms=64_000,
-            elements=["H", "O"],
-            reference_keys=["pbe_energy", "pbe_forces"],
+            sources=[
+                DataSourceSummary(
+                    name="water",
+                    num_configurations=1200,
+                    num_atoms=64_000,
+                    elements=["H", "O"],
+                    reference_keys=["pbe_energy", "pbe_forces"],
+                ),
+                DataSourceSummary(name="ice", elements=["H", "O"]),
+            ]
         ),
-        e0=E0Details(
-            source="estimated",
-            method="least_squares",
-            parameters={"reference_key": "pbe_energy"},
-            values={"H": -13.6, "O": -430.2},
-        ),
+        e0={
+            "pbe": E0Details(
+                source="estimated",
+                method="least_squares",
+                parameters={"reference_key": "pbe_energy"},
+                values={"H": -13.6, "O": -430.2},
+            ),
+            "r2scan": E0Details(source="explicit", values={"H": -13.7, "O": -431.0}),
+        },
         doi="10.5281/zenodo.0000000",
         citations=[MACE_PAPER, Citation(title="A dataset paper", doi="10.1000/xyz")],
         notes="Trained for the round-trip test.",
@@ -70,7 +80,7 @@ def test_minimal_record_round_trips_too():
         config=ConfigRecord(), provenance=Provenance(code_version="0.0.0")
     )
     assert ModelMetadata.from_json(record.to_json()) == record
-    assert record.e0 is None
+    assert record.e0 == {}
 
 
 def test_config_and_provenance_are_mandatory():
@@ -80,10 +90,28 @@ def test_config_and_provenance_are_mandatory():
 
 def test_lossy_value_is_refused_rather_than_stored():
     record = full_record()
-    assert record.e0 is not None
-    record.e0.parameters["shape"] = (2, 3)  # JSON would bring it back as a list
+    record.e0["pbe"].parameters["shape"] = (2, 3)  # JSON brings it back as a list
     with pytest.raises(MetadataSchemaError, match="does not survive a JSON round trip"):
         record.to_json()
+
+
+def test_lineage_round_trips_through_two_levels():
+    foundation = ParentModel(role="initial_weights", name="mace-mp-0b3")  # no record
+    distilled = full_record()
+    distilled.parents = [
+        foundation,
+        ParentModel(role="teacher", name="teacher.model", metadata=full_record()),
+    ]
+    fine_tuned = full_record()
+    fine_tuned.parents = [
+        ParentModel(role="initial_weights", name="distilled.model", metadata=distilled)
+    ]
+    back = ModelMetadata.from_json(fine_tuned.to_json())
+    assert back == fine_tuned
+    assert back.parents[0].metadata is not None
+    grandparents = back.parents[0].metadata.parents
+    assert [p.role for p in grandparents] == ["initial_weights", "teacher"]
+    assert grandparents[0].metadata is None
 
 
 def test_schema_version_is_written():
@@ -134,11 +162,9 @@ def test_infinity_survives_and_nan_is_refused():
     # pass the round-trip check; an E0 or a config value that is NaN is a bug
     # upstream, not something to store.
     record = full_record()
-    assert record.e0 is not None
-    record.e0.values["H"] = float("inf")
+    record.e0["pbe"].values["H"] = float("inf")
     back = ModelMetadata.from_json(record.to_json())
-    assert back.e0 is not None
-    assert back.e0.values["H"] == float("inf")
+    assert back.e0["pbe"].values["H"] == float("inf")
     record.config.resolved["cutoff"] = float("nan")
     with pytest.raises(MetadataSchemaError, match="does not survive"):
         record.to_json()

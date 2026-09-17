@@ -22,8 +22,6 @@ dependencies = [
     # releases.
     "pydantic>=2.7",
     "pyyaml>=6.0",
-    # The stdlib tomllib exists only from 3.11; tomli is the same code on
-    # every version, and one import is simpler than a version branch.
     "tomli>=2.0",
 ]
 
